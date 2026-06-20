@@ -1,375 +1,332 @@
 """
-rag_core_langchain.py — LangChain version of the DharmaAI RAG pipeline.
+rag_core.py — Plain Python RAG pipeline for DharmaAI.
 
-Compare this with rag_core.py (plain Python version) to understand
-exactly what LangChain abstracts away.
+Pipeline:
+0. Check if message is casual chat or a real situation
+1. Classify intent (career/relationship/family/stress/growth)
+2. Retrieve relevant wisdom chunks from ChromaDB (dual-query)
+3. Build prompt with retrieved wisdom + conversation history
+4. Generate structured guidance with Gemini
 
-Same result, less code, less visibility into internals.
-Both versions are kept in the repo intentionally:
-- rag_core.py        = plain Python (shows understanding of internals)
-- rag_core_langchain.py = LangChain (shows framework knowledge)
+Model: gemini-2.5-flash-lite — chosen for its generous free-tier daily
+quota (~1000/day) compared to gemini-2.5-flash (~20/day). Since each
+user message can require 2-3 API calls (casual check, classify, generate),
+quota efficiency matters a lot during development and testing.
 """
 
 import os
+import chromadb
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
-# ── LangChain imports ─────────────────────────────────────────────────────────
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-# RecursiveCharacterTextSplitter = our chunk_text() function
-# It tries to split on paragraphs first, then sentences, then words
-# "Recursive" means it tries multiple separators in order
-
-from langchain_community.vectorstores import Chroma
-# Chroma = wrapper around ChromaDB
-# Handles embedding + storing + searching in one object
-
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-# GoogleGenerativeAIEmbeddings = wrapper around Gemini embedding API
-# ChatGoogleGenerativeAI = wrapper around Gemini generation API
-
-from langchain.chains import RetrievalQA
-# RetrievalQA = combines retriever + LLM into one callable chain
-# Handles: embed query → search → build prompt → generate → return
-
-from langchain.prompts import PromptTemplate
-# PromptTemplate = structured way to define prompts with variables
-# Like an f-string but with validation and reusability
-
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-# Document loaders = read files and return LangChain Document objects
-# Each Document has .page_content (text) and .metadata (source info)
-
-# ── Load API key ──────────────────────────────────────────────────────────────
+# ── Load API key ─────────────────────────────────────────────────────────────
 load_dotenv()
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+client_ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# ── Initialize Gemini components via LangChain ────────────────────────────────
-# In plain Python: client_ai = genai.Client(api_key=...)
-# In LangChain: separate objects for embeddings vs generation
+# ── Connect to ChromaDB (already populated by ingest.py) ─────────────────────
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_collection("dharmaai")
+print(f"Connected to ChromaDB — {collection.count()} chunks available")
 
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/embedding-001",
-    google_api_key=GEMINI_API_KEY,
-    task_type="retrieval_document"
-)
+# Model used for all text generation in this file
+GEN_MODEL = "gemini-2.5-flash-lite"
+EMBED_MODEL = "gemini-embedding-001"
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    google_api_key=GEMINI_API_KEY,
-    temperature=0.7,
-    max_output_tokens=1000
-)
 
-# ── Load and chunk documents using LangChain ──────────────────────────────────
-def load_documents():
+# ── STEP 0: CASUAL MESSAGE DETECTION ─────────────────────────────────────────
+def is_casual_message(user_message):
     """
-    LangChain version of reading + chunking files.
+    Detect if this is small talk (greeting, thanks, introducing themselves)
+    rather than a genuine life situation needing wisdom-based guidance.
 
-    Plain Python version (rag_core.py):
-        raw = read_file(filepath)
-        chunks = chunk_text(raw, chunk_size=400, overlap=50)
-
-    LangChain version:
-        loader = PyPDFLoader(filepath)  ← reads the file
-        docs = loader.load()            ← returns list of Document objects
-        chunks = splitter.split_documents(docs)  ← splits into chunks
-
-    Key difference: LangChain Document objects carry metadata automatically
-    (page number, source filename) without you manually tracking it.
+    Without this check, "hi" would trigger the full RAG pipeline and come
+    back as a formal 5-section structured response — which feels robotic.
+    A real guru responds to "hello" warmly, not with a sermon.
     """
+    check_prompt = f"""
+Is this message casual small talk (greeting, thanks, goodbye, "how are you",
+introducing themselves) OR a genuine life situation/problem seeking guidance?
 
-    # Text splitter — equivalent to our chunk_text() function
-    # RecursiveCharacterTextSplitter tries these separators in order:
-    # paragraphs (\n\n) → sentences (\n) → words ( ) → characters ("")
-    # This produces more semantically meaningful chunks than fixed word count
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,       # characters (not words like our version)
-        chunk_overlap=150,     # character overlap between chunks
-        separators=["\n\n", "\n", " ", ""]
-    )
+Message: "{user_message}"
 
-    all_docs = []
-
-    sources = [
-        {"file": "data/bhagavad-gita-in-english-source-file.pdf", "source": "gita"},
-        {"file": "data/the_mahabharata.pdf",                      "source": "mahabharata"},
-        {"file": "data/meditations.txt",                          "source": "meditations"},
-    ]
-
-    for source in sources:
-        if not os.path.exists(source["file"]):
-            print(f"Skipping {source['file']} — not found")
-            continue
-
-        print(f"Loading: {source['file']}")
-
-        # Choose loader based on file type
-        if source["file"].endswith(".pdf"):
-            loader = PyPDFLoader(source["file"])
-        else:
-            loader = TextLoader(source["file"], encoding="utf-8")
-
-        # Load returns list of Document objects (one per page for PDF)
-        documents = loader.load()
-
-        # Add our custom source metadata to each document
-        for doc in documents:
-            doc.metadata["source"] = source["source"]
-
-        # Split into chunks — returns list of smaller Document objects
-        chunks = splitter.split_documents(documents)
-        all_docs.extend(chunks)
-        print(f"  → {len(chunks)} chunks created")
-
-    print(f"\nTotal chunks: {len(all_docs)}")
-    return all_docs
-
-
-# ── Build or load ChromaDB vectorstore ───────────────────────────────────────
-def get_vectorstore(rebuild=False):
-    """
-    Plain Python version (rag_core.py):
-        collection = chroma_client.get_collection("dharmaai")
-        # then manually embed query and call collection.query()
-
-    LangChain version:
-        vectorstore = Chroma(...)
-        # vectorstore.as_retriever() handles embedding + querying automatically
-
-    The LangChain Chroma wrapper:
-    - Embeds documents automatically when you call .from_documents()
-    - Embeds queries automatically when you call .similarity_search()
-    - You never manually call the embedding API
-    """
-
-    chroma_dir = "./chroma_db_langchain"  # separate from plain Python version
-
-    if os.path.exists(chroma_dir) and not rebuild:
-        print("Loading existing LangChain ChromaDB...")
-        # Load existing vectorstore — no re-embedding needed
-        vectorstore = Chroma(
-            persist_directory=chroma_dir,
-            embedding_function=embeddings,
-            collection_name="dharmaai_langchain"
+Reply with ONLY one word: "casual" or "situation"
+"""
+    response = client_ai.models.generate_content(
+        model=GEN_MODEL,
+        contents=check_prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=10,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
         )
-        print(f"Loaded {vectorstore._collection.count()} chunks")
-        return vectorstore
-
-    print("Building new LangChain ChromaDB...")
-    docs = load_documents()
-
-    # Chroma.from_documents():
-    # 1. Takes each document's text
-    # 2. Calls embeddings.embed_documents() on each (our get_embedding())
-    # 3. Stores text + embedding + metadata in ChromaDB
-    # All 3 steps in one line vs our manual loop
-    vectorstore = Chroma.from_documents(
-        documents=docs,
-        embedding=embeddings,
-        persist_directory=chroma_dir,
-        collection_name="dharmaai_langchain"
     )
-
-    print(f"Built vectorstore with {vectorstore._collection.count()} chunks")
-    return vectorstore
+    return "casual" in response.text.strip().lower()
 
 
-# ── Intent Classification (same as plain Python version) ─────────────────────
+def generate_casual_reply(user_message, chat_history):
+    """
+    Generate a warm, brief, guru-like reply for small talk.
+    Uses chat_history so it doesn't repeat itself (e.g. asking your name twice).
+    """
+    history_text = ""
+    if chat_history:
+        for turn in chat_history[-6:]:
+            history_text += f"{turn['role']}: {turn['content']}\n"
+
+    prompt = f"""
+You are DharmaAI — a warm, wise guide rooted in dharmic philosophy.
+Someone is making casual conversation, not asking for deep guidance yet.
+
+Respond briefly and warmly, like a wise teacher greeting a student —
+no headers, no bullet points, no formal structure. 1-3 sentences max.
+You may gently invite them to share what's on their mind, but don't force it.
+If they already told you their name earlier, use it naturally.
+
+Conversation so far:
+{history_text if history_text else "(this is the first message)"}
+
+Their message: "{user_message}"
+
+Your reply:
+"""
+    response = client_ai.models.generate_content(
+        model=GEN_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.8,
+            max_output_tokens=150,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        )
+    )
+    return response.text.strip()
+
+
+# ── STEP 1: INTENT CLASSIFICATION ────────────────────────────────────────────
 def classify_intent(user_message):
-    """
-    LangChain has a PromptTemplate for structured prompts.
-    This replaces our plain f-string prompt.
+    """Classify the user's message into one of 5 life categories."""
 
-    Plain Python version:
-        prompt = f"Classify this: {user_message}. Reply with one word."
-        response = client_ai.models.generate_content(model=..., contents=prompt)
-        return response.text.strip()
+    classification_prompt = f"""
+You are a life situation classifier for DharmaAI, a wisdom-based guidance system.
 
-    LangChain version:
-        template = PromptTemplate(input_variables=["message"], template="...")
-        chain = template | llm  ← pipe operator chains template → llm
-        response = chain.invoke({"message": user_message})
-    """
-
-    classification_template = PromptTemplate(
-        input_variables=["message"],
-        template="""
-Classify the user's message into EXACTLY ONE category:
-- career: work, job, purpose, ambition, direction
-- relationship: romantic relationships, heartbreak, loneliness, attachment
-- family: parents, siblings, family conflict, expectations
-- stress: anxiety, overwhelm, mental health, burnout, fear
-- growth: self-improvement, habits, meaning, spiritual seeking
+Classify the user's message into EXACTLY ONE of these categories:
+- career: work, job, purpose, ambition, success, failure, direction
+- relationship: romantic relationships, heartbreak, loneliness, attachment, love
+- family: parents, siblings, children, family conflict, expectations
+- stress: anxiety, overwhelm, mental health, burnout, fear, worry
+- growth: self-improvement, habits, meaning, identity, spiritual seeking
 
 Examples:
-"I lost my job" → career
-"Someone I loved left me" → relationship
-"My parents don't understand me" → family
-"I feel anxious all the time" → stress
-"I want to become a better person" → growth
+"I lost my job and don't know what to do" → career
+"Someone I loved left me without explanation" → relationship
+"My parents don't understand my choices" → family
+"I feel anxious all the time and can't sleep" → stress
+"I want to become a better person but don't know how" → growth
 
-User message: "{message}"
+User message: "{user_message}"
 
 Reply with ONLY the category word. Nothing else.
 """
+    response = client_ai.models.generate_content(
+        model=GEN_MODEL,
+        contents=classification_prompt,
+        config=types.GenerateContentConfig(
+            max_output_tokens=10,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        )
     )
 
-    # The pipe operator (|) chains: template → llm
-    # This is LangChain's "chain" concept — composable steps
-    chain = classification_template | llm
-    response = chain.invoke({"message": user_message})
-
-    # LangChain LLM returns AIMessage object, .content gets the text
-    category = response.content.strip().lower().replace(".", "")
-
-    valid = ["career", "relationship", "family", "stress", "growth"]
-    return category if category in valid else "stress"
+    category = response.text.strip().lower().replace(".", "").replace("\n", "")
+    valid_categories = ["career", "relationship", "family", "stress", "growth"]
+    return category if category in valid_categories else "stress"
 
 
-# ── Build RAG Chain ───────────────────────────────────────────────────────────
-def build_rag_chain(vectorstore, category):
+# ── STEP 2: RETRIEVAL ─────────────────────────────────────────────────────────
+def retrieve_wisdom(user_message, category, n_results=5):
     """
-    This is the biggest difference from plain Python.
+    Search ChromaDB for relevant wisdom chunks using dual-query retrieval.
 
-    Plain Python version (rag_core.py):
-        1. chunks = retrieve_wisdom(user_message, category)  ← manual search
-        2. prompt = build_prompt(chunks, category, user_message)  ← manual
-        3. response = generate_guidance(prompt)  ← manual API call
-
-    LangChain version:
-        chain = RetrievalQA.from_chain_type(llm, retriever, prompt)
-        result = chain.invoke({"query": user_message})
-        ← ALL 3 steps happen inside chain.invoke()
-
-    The chain automatically:
-    - Embeds the query
-    - Searches ChromaDB
-    - Inserts retrieved chunks into the prompt template
-    - Calls the LLM
-    - Returns the result
+    We search twice — once with the user's exact words, once with
+    category-specific keywords — because the user's vocabulary often
+    differs from the source text's vocabulary. E.g. user says "he left me",
+    Gita talks about "attachment and impermanence". Merging both searches
+    catches relevant chunks that a single search would miss.
     """
-
-    # Category-specific prompt angles — same logic as plain Python version
-    category_angles = {
-        "career":       "Focus on dharma (duty/purpose), karma yoga (action without attachment to results), svadharma (your own path).",
-        "relationship": "Focus on karmic lessons in relationships, attachment vs love, impermanence. Reframe: this person was a karmic mirror, not a permanent fixture. Find the LESSON.",
-        "family":       "Focus on dharmic obligations, complexity of love and duty, how even great families face impossible choices.",
-        "stress":       "Focus on equanimity (samatvam), the observer mind (sakshi), what is and isn't in our control.",
-        "growth":       "Focus on self-knowledge (atma jnana), the journey of the soul, how every challenge is a curriculum for growth."
+    category_context = {
+        "career":       "duty work purpose action karma yoga dharma profession",
+        "relationship": "attachment love loss letting go impermanence karmic bond",
+        "family":       "duty family dharma obligation respect relationships bonds",
+        "stress":       "fear anxiety mind peace equanimity suffering acceptance",
+        "growth":       "self knowledge wisdom spiritual growth transformation soul"
     }
 
-    # PromptTemplate with {context} and {question} as required variables
-    # {context} = retrieved chunks (LangChain fills this automatically)
-    # {question} = user's message (LangChain fills this automatically)
-    dharma_prompt = PromptTemplate(
-        input_variables=["context", "question"],
-        template=f"""
-You are DharmaAI — a wisdom-based life guidance system.
+    user_embedding = client_ai.models.embed_content(
+        model=EMBED_MODEL,
+        contents=user_message,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
+    ).embeddings[0].values
 
-IMPORTANT:
+    context_embedding = client_ai.models.embed_content(
+        model=EMBED_MODEL,
+        contents=category_context[category],
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
+    ).embeddings[0].values
+
+    results_user = collection.query(
+        query_embeddings=[user_embedding],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+    results_context = collection.query(
+        query_embeddings=[context_embedding],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+
+    combined = {}
+    for doc, meta, dist in zip(results_user["documents"][0], results_user["metadatas"][0], results_user["distances"][0]):
+        combined[doc[:50]] = {"text": doc, "source": meta["source"], "distance": dist}
+    for doc, meta, dist in zip(results_context["documents"][0], results_context["metadatas"][0], results_context["distances"][0]):
+        key = doc[:50]
+        if key not in combined:
+            combined[key] = {"text": doc, "source": meta["source"], "distance": dist}
+
+    sorted_chunks = sorted(combined.values(), key=lambda x: x["distance"])
+    return sorted_chunks[:6]
+
+
+# ── STEP 3 & 4: PROMPT BUILDING + GENERATION ─────────────────────────────────
+def generate_guidance(user_message, category, retrieved_chunks, chat_history=None):
+    """
+    Build a category-specific prompt (with retrieved wisdom + conversation
+    history) and generate structured guidance.
+    """
+    wisdom_context = ""
+    for i, chunk in enumerate(retrieved_chunks):
+        source_label = {
+            "gita":        "Bhagavad Gita",
+            "mahabharata": "Mahabharata",
+            "meditations": "Meditations (Marcus Aurelius)"
+        }.get(chunk["source"], chunk["source"])
+        wisdom_context += f"\n[Source {i+1}: {source_label}]\n{chunk['text'][:400]}\n"
+
+    history_text = ""
+    if chat_history:
+        for turn in chat_history[-6:]:
+            speaker = "User" if turn["role"] == "user" else "DharmaAI"
+            history_text += f"{speaker}: {turn['content'][:200]}\n"
+
+    category_angles = {
+        "career": "Focus on dharma (duty/purpose), karma yoga (action without attachment to results), svadharma (your own path vs someone else's).",
+        "relationship": "Focus on the karmic nature of relationships (people enter our lives as teachers), attachment vs love, impermanence. Reframe: this person was a karmic mirror, not a permanent fixture. Find the LESSON.",
+        "family": "Focus on dharmic obligations, the complexity of love and duty, how even great families face impossible choices.",
+        "stress": "Focus on equanimity (samatvam), the observer mind (sakshi), what is and isn't in our control.",
+        "growth": "Focus on self-knowledge (atma jnana), the journey of the soul, how every challenge is a curriculum for growth."
+    }
+
+    prompt = f"""
+You are DharmaAI — a wise, warm guide rooted in dharmic philosophy and timeless
+psychological insight. You are having an ONGOING CONVERSATION with this person,
+like a guru with a student — not answering an isolated question.
+
+IMPORTANT RULES:
 - NEVER say "everything will be okay" or give empty comfort
-- DO reframe situations through dharma, karma, and timeless wisdom
-- Speak with warmth and depth — like a wise elder
+- DO reframe their situation through dharma, karma, and wisdom
+- If conversation history exists below, reference it naturally — remember
+  names, earlier situations, what you already told them. Don't repeat yourself.
+- Speak like a wise elder who remembers this person
 
-GUIDANCE ANGLE FOR THIS SITUATION:
-{category_angles.get(category, category_angles['stress'])}
+CONVERSATION SO FAR:
+{history_text if history_text else "(this is the start of the conversation)"}
+
+CATEGORY: {category.upper()} SITUATION
+{category_angles[category]}
 
 RETRIEVED WISDOM FROM SACRED TEXTS:
-{{context}}
+{wisdom_context}
 
-USER'S SITUATION:
-"{{question}}"
+USER'S CURRENT MESSAGE:
+"{user_message}"
 
-Respond in EXACTLY this structure:
+Respond in EXACTLY this structure. BE CONCISE — keep ENTIRE response under 150 words:
 
 **Situation:**
-(One sentence — what they're really going through at a deeper level)
+(ONE short sentence)
 
 **Wisdom:**
-(2-3 sentences from the retrieved texts above. Mention the source.)
+(1-2 short sentences, mention source briefly)
 
 **The Deeper Lesson:**
-(The karmic/dharmic reframe specific to THEIR situation)
+(ONE short sentence)
 
 **Three Steps Forward:**
-1. (Wisdom-rooted action)
-2. (Wisdom-rooted action)
-3. (Wisdom-rooted action)
+1. (Short action, under 12 words)
+2. (Short action, under 12 words)
+3. (Short action, under 12 words)
 
 **Reflect On This:**
-(One powerful question for self-inquiry)
+(ONE short question, under 15 words)
 """
+    response = client_ai.models.generate_content(
+        model=GEN_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            max_output_tokens=500,
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        )
     )
-
-    # as_retriever() converts vectorstore into a retriever object
-    # search_kwargs={"k": 6} = return top 6 most similar chunks
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",  # cosine similarity search
-        search_kwargs={"k": 6}
-    )
-
-    # RetrievalQA chain ties everything together:
-    # query → retriever → prompt → llm → answer
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",  # "stuff" = put all chunks into one prompt
-        retriever=retriever,
-        chain_type_kwargs={"prompt": dharma_prompt},
-        return_source_documents=True  # include which chunks were used
-    )
-
-    return chain
+    return response.text
 
 
-# ── Main Pipeline Function ────────────────────────────────────────────────────
-def get_guidance_langchain(user_message):
+# ── MAIN PIPELINE ─────────────────────────────────────────────────────────────
+def get_guidance(user_message, chat_history=None):
     """
-    Same interface as get_guidance() in rag_core.py.
-    Drop-in replacement — FastAPI can call either version.
-    """
-    print(f"\nProcessing (LangChain): '{user_message[:50]}...'")
+    Single entry point. FastAPI calls only this function.
 
-    # Step 1: Classify intent
+    chat_history: optional list of {"role": "user"/"dharmaai", "content": str}
+    representing the conversation so far — gives DharmaAI memory across turns.
+    """
+    print(f"\nProcessing: '{user_message[:50]}...'")
+
+    if is_casual_message(user_message):
+        print("  Detected: casual message")
+        reply = generate_casual_reply(user_message, chat_history)
+        return {"category": "casual", "guidance": reply, "sources": [], "chunks_used": 0}
+
     category = classify_intent(user_message)
-    print(f"  Category: {category}")
+    print(f"  Detected category: {category}")
 
-    # Step 2: Load vectorstore
-    vectorstore = get_vectorstore(rebuild=False)
+    chunks = retrieve_wisdom(user_message, category)
+    print(f"  Retrieved {len(chunks)} chunks from: {list(set(c['source'] for c in chunks))}")
 
-    # Step 3: Build and run RAG chain
-    chain = build_rag_chain(vectorstore, category)
-    result = chain.invoke({"query": user_message})
-
-    # Extract source documents used
-    source_docs = result.get("source_documents", [])
-    sources = list(set(
-        doc.metadata.get("source", "unknown")
-        for doc in source_docs
-    ))
-
-    print(f"  Sources used: {sources}")
+    guidance = generate_guidance(user_message, category, chunks, chat_history)
+    print(f"  Generated response ({len(guidance)} chars)")
 
     return {
         "category": category,
-        "guidance": result["result"],
-        "sources": sources,
-        "chunks_used": len(source_docs)
+        "guidance": guidance,
+        "sources": list(set(c["source"] for c in chunks)),
+        "chunks_used": len(chunks)
     }
 
 
-# ── Test directly ─────────────────────────────────────────────────────────────
+# ── TEST ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("="*60)
-    print("DharmaAI — LangChain Version")
+    print("Testing DharmaAI conversation flow")
     print("="*60)
 
-    test_message = "Someone came into my life unexpectedly but left without reason and I feel lost"
+    history = []
+    test_flow = [
+        "hello, this is Usha",
+        "I feel stuck in my career and don't know what direction to take",
+        "thank you, that helps"
+    ]
 
-    print(f"\nUSER: {test_message}")
-    print("-"*60)
-
-    result = get_guidance_langchain(test_message)
-
-    print("\nDHARMAI RESPONSE (LangChain):")
-    print(result["guidance"])
-    print(f"\n[Category: {result['category']} | Sources: {result['sources']}]")
+    for msg in test_flow:
+        print(f"\nUSER: {msg}")
+        result = get_guidance(msg, chat_history=history)
+        print(f"DHARMAI: {result['guidance']}")
+        print(f"[category: {result['category']}]")
+        history.append({"role": "user", "content": msg})
+        history.append({"role": "dharmaai", "content": result["guidance"]})
